@@ -1,21 +1,25 @@
 /**
  * background.js
  *
- * Uses the CDP Fetch domain to intercept JS bundle responses in-flight and
- * inject a `SourceMap` response header before Chrome's JS engine parses the
- * script. This means DevTools associates the source map at parse time, so
- * call stacks resolve to original source rather than showing VM#### bundle.js.
+ * The key insight: Chrome's DevTools reads sourceMapURL exclusively from the
+ * Debugger.scriptParsed event. That field is populated by V8 when it parses
+ * the script and finds either:
+ *   a) a //# sourceMappingURL= pragma in the script body, OR
+ *   b) a SourceMap / X-SourceMap HTTP response header
  *
- * Flow:
- *  1. Attach CDP debugger to the tab.
- *  2. Enable Fetch domain with a pattern matching all Script resources.
- *  3. On Fetch.requestPaused (response stage):
- *     a. If the response already has a SourceMap/X-SourceMap header -> pass through.
- *     b. Otherwise probe <script-url>.map with a HEAD request.
- *     c. If the map exists, append a SourceMap header and continue the response.
- *     d. Either way, call Fetch.continueResponse so the request is never stalled.
- *  4. Also listen to Debugger.scriptParsed to catch scripts already in the page
- *     before we attached (cached / inline).
+ * Fetch.continueResponse with patched headers is NOT sufficient because
+ * Chrome only allows header modification via continueResponse for request
+ * headers, not response headers. To modify response headers you must use
+ * Fetch.fulfillRequest, which requires supplying the full response body.
+ *
+ * So the correct approach is:
+ *  1. Intercept the response via Fetch domain (requestStage: Response)
+ *  2. Read the full response body via Fetch.getResponseBody
+ *  3. Append //# sourceMappingURL=<url> to the body
+ *  4. Fulfill the request with the modified body via Fetch.fulfillRequest
+ *
+ * This way V8 sees the pragma when parsing, scriptParsed fires with
+ * sourceMapURL set, and DevTools loads and displays the source files.
  */
 
 const BUNDLE_PATTERN = /\.(bundle|chunk|min)\.js(\?[^.]*)?$|\/[0-9a-f]{8,}\.js(\?.*)?$/i;
@@ -54,7 +58,7 @@ async function attachToTab(tabId) {
 
     await sendCommand(tabId, "Debugger.enable", {});
 
-    // Intercept all Script responses — filter to bundles inside the handler
+    // Intercept all Script responses at the response stage
     await sendCommand(tabId, "Fetch.enable", {
       patterns: [{ requestStage: "Response", resourceType: "Script" }],
     });
@@ -77,13 +81,8 @@ async function detachFromTab(tabId) {
 
 // --- Fetch interception ------------------------------------------------------
 
-/**
- * Called for every Script response while paused.
- * We MUST always call Fetch.continueResponse before returning — otherwise
- * the request hangs indefinitely and the page stalls.
- */
 async function handleFetchRequestPaused(tabId, params, state) {
-  const { requestId, request, responseHeaders } = params;
+  const { requestId, request, responseHeaders, responseStatusCode } = params;
   const url = request.url;
 
   // Pass non-bundle scripts straight through
@@ -98,7 +97,7 @@ async function handleFetchRequestPaused(tabId, params, state) {
     headersArray.map(h => [h.name.toLowerCase(), h.value])
   );
 
-  // Already has a SourceMap header — record and pass through
+  // Already has a SourceMap header — record and pass through untouched
   const existingMapHeader = headerMap["sourcemap"] || headerMap["x-sourcemap"];
   if (existingMapHeader) {
     const resolvedMap = resolveMapUrl(url, existingMapHeader);
@@ -107,7 +106,7 @@ async function handleFetchRequestPaused(tabId, params, state) {
     return;
   }
 
-  // No header — probe for <url>.map
+  // Probe for <url>.map
   const probeUrl = url.split("?")[0] + ".map";
   const mapExists = await probeMapUrl(probeUrl);
 
@@ -117,30 +116,47 @@ async function handleFetchRequestPaused(tabId, params, state) {
     return;
   }
 
-  // Map found — inject the SourceMap header before Chrome parses the script
-  const patchedHeaders = [...headersArray, { name: "SourceMap", value: probeUrl }];
-
+  // Map found — we need to append the pragma to the response body.
+  // Fetch.continueResponse cannot modify response headers in Chrome (only
+  // request headers), so we must use Fetch.fulfillRequest with the full body.
   try {
-    await sendCommand(tabId, "Fetch.continueResponse", {
+    const bodyResult = await sendCommand(tabId, "Fetch.getResponseBody", { requestId });
+
+    // bodyResult.base64Encoded tells us if the body is base64 or plain text
+    let bodyText;
+    if (bodyResult.base64Encoded) {
+      bodyText = atob(bodyResult.body);
+    } else {
+      bodyText = bodyResult.body;
+    }
+
+    // Append the sourceMappingURL pragma
+    const patchedBody = bodyText + `\n//# sourceMappingURL=${probeUrl}\n`;
+    const patchedBase64 = btoa(unescape(encodeURIComponent(patchedBody)));
+
+    // Fulfill with the patched body, preserving original status and headers
+    await sendCommand(tabId, "Fetch.fulfillRequest", {
       requestId,
-      responseHeaders: patchedHeaders,
+      responseCode: responseStatusCode || 200,
+      responseHeaders: headersArray,
+      body: patchedBase64,
     });
+
     recordScript(tabId, state, { url, sourceMapURL: probeUrl, status: "map_found", intercepted: true });
   } catch (err) {
-    // continueResponse failed (request cancelled etc.) — don't stall the page
-    console.warn("[SourceMap Loader] continueResponse failed:", err.message);
+    // If body fetch or fulfill fails, don't stall the page
+    console.warn("[SourceMap Loader] body patching failed, passing through:", err.message);
     await continueResponse(tabId, requestId).catch(() => {});
-    recordScript(tabId, state, { url, sourceMapURL: probeUrl, status: "map_found", intercepted: false });
+    recordScript(tabId, state, { url, sourceMapURL: probeUrl, status: "no_map", intercepted: false });
   }
 }
 
 // --- Debugger.scriptParsed ---------------------------------------------------
 
 /**
- * Fires after the script is parsed. The Fetch interceptor already ran by this
- * point, so sourceMapURL will be populated if we injected the header. We use
- * this mainly to catch scripts already present before we attached (cached /
- * inline scripts that bypass the Fetch domain).
+ * Fires after V8 parses the script. If our body patching worked, sourceMapURL
+ * will be populated here. We use this as confirmation and to catch any scripts
+ * that were already present before we attached (e.g. cached).
  */
 function handleScriptParsed(tabId, params, state) {
   const { url, sourceMapURL } = params;
@@ -162,14 +178,13 @@ function handleScriptParsed(tabId, params, state) {
 
 function recordScript(tabId, state, entry) {
   const existing = state.scripts.get(entry.url);
-  // Don't downgrade a successfully intercepted entry with a later scriptParsed
   if (existing?.intercepted && !entry.intercepted) return;
 
   state.scripts.set(entry.url, entry);
   broadcastToPanel({ type: existing ? "SCRIPT_UPDATED" : "SCRIPT_DETECTED", tabId, script: entry });
 
   if (entry.status === "map_found" && entry.intercepted) {
-    broadcastToPanel({ type: "LOG", tabId, level: "ok", msg: `SourceMap header injected: ${shortUrl(entry.url)} -> ${shortUrl(entry.sourceMapURL)}` });
+    broadcastToPanel({ type: "LOG", tabId, level: "ok", msg: `Pragma injected into body: ${shortUrl(entry.url)} -> ${shortUrl(entry.sourceMapURL)}` });
   } else if (entry.status === "no_map") {
     broadcastToPanel({ type: "LOG", tabId, level: "warn", msg: `No map found for: ${shortUrl(entry.url)}` });
   } else if (entry.status === "has_map") {
@@ -181,7 +196,7 @@ async function continueResponse(tabId, requestId) {
   try {
     await sendCommand(tabId, "Fetch.continueResponse", { requestId });
   } catch (err) {
-    console.warn("[SourceMap Loader] continueResponse fallback failed:", err.message);
+    console.warn("[SourceMap Loader] continueResponse failed:", err.message);
   }
 }
 
@@ -226,9 +241,7 @@ function sendCommand(tabId, method, params) {
 }
 
 function broadcastToPanel(message) {
-  chrome.runtime.sendMessage(message).catch(() => {
-    // Panel may not be open — that's fine
-  });
+  chrome.runtime.sendMessage(message).catch(() => {});
 }
 
 // --- Message handler (from panel) --------------------------------------------
