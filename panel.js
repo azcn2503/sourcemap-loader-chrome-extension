@@ -59,23 +59,12 @@ chrome.runtime.onMessage.addListener((message) => {
       break;
 
     case "SCRIPT_DETECTED":
-      upsertScript(message.script);
-      log("info", `Detected: ${shortUrl(message.script.url)}`);
-      break;
-
     case "SCRIPT_UPDATED":
       upsertScript(message.script);
-      const s = message.script;
-      if (s.status === "map_found")
-        log("ok", `Map found & injected: ${shortUrl(s.sourceMapURL)}`);
-      else if (s.status === "no_map")
-        log("warn", `No map found for: ${shortUrl(s.url)}`);
-      else if (s.status === "has_map")
-        log("ok", `Map already present: ${shortUrl(s.sourceMapURL)}`);
       break;
 
-    case "HEADER_MAP_FOUND":
-      log("ok", `SourceMap header found for ${shortUrl(message.scriptUrl)} → ${shortUrl(message.mapUrl)}`);
+    case "LOG":
+      log(message.level, message.msg);
       break;
   }
 });
@@ -154,11 +143,7 @@ function renderAll() {
     existingRows.delete(entry.url);
     row.innerHTML = buildRowHTML(entry);
 
-    // Retry button
-    const retryBtn = row.querySelector(".retry-btn");
-    if (retryBtn) {
-      retryBtn.addEventListener("click", () => retryInject(entry));
-    }
+
   });
 
   // Remove stale rows
@@ -189,9 +174,7 @@ function buildRowHTML(entry) {
     ? `<a href="${entry.sourceMapURL}" title="${entry.sourceMapURL}" target="_blank">${shortUrl(entry.sourceMapURL)}</a>`
     : `<span class="no-map-text">—</span>`;
 
-  const retryBtn = (entry.status === "map_found" || entry.status === "has_map") && entry.sourceMapURL
-    ? `<button class="btn btn--ghost btn--xs retry-btn" title="Re-inject sourceMappingURL">↺</button>`
-    : "";
+  const retryBtn = "";
 
   return `
     <td><span class="${pillClass}">${displayStatus}</span></td>
@@ -217,19 +200,6 @@ function updateAttachUI() {
     statusBadge.className = "badge badge--detached";
     toggleBtn.textContent = "Attach";
   }
-}
-
-// ─── Actions ──────────────────────────────────────────────────────────────────
-
-async function retryInject(entry) {
-  log("info", `Re-injecting for ${shortUrl(entry.url)}…`);
-  const result = await sendMsg({
-    type: "RETRY_INJECT",
-    tabId: currentTabId,
-    scriptId: entry.scriptId,
-  });
-  if (result.ok) log("ok", "Re-injection sent.");
-  else log("error", result.error);
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

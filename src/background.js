@@ -1,46 +1,40 @@
 /**
  * background.js
  *
- * Service worker that:
- * 1. Attaches the Chrome Debugger (CDP) to a tab when requested.
- * 2. Listens for Debugger.scriptParsed events to detect JS bundles.
- * 3. Probes for a corresponding .map file.
- * 4. If found, calls Debugger.setScriptSource is NOT available in real CDP for
- *    source-map injection — instead we use the proper approach:
- *    Emit the sourceMapURL back to the panel and store it so the Sources tab
- *    picks it up via the x-sourcemap / SourceMappingURL header manipulation
- *    through Network.responseReceived interception.
+ * Uses the CDP Fetch domain to intercept JS bundle responses in-flight and
+ * inject a `SourceMap` response header before Chrome's JS engine parses the
+ * script. This means DevTools associates the source map at parse time, so
+ * call stacks resolve to original source rather than showing VM#### bundle.js.
  *
- * Approach used:
- *  - Enable Debugger + Network domains via CDP.
- *  - On Network.responseReceived for a JS bundle, check if a .map URL exists.
- *  - If the response already has a SourceMap header or sourceMappingURL — great,
- *    just record it.
- *  - If NOT, fetch the .map URL (HEAD request) to confirm it exists, then
- *    use Network.interceptRequestWithResponse isn't available in MV3 cleanly,
- *    so we inject a <script> tag via Runtime.evaluate that appends
- *    //# sourceMappingURL=<url> via a Blob URL trick so DevTools picks it up.
- *
- * This is the most reliable cross-origin compatible approach in MV3.
+ * Flow:
+ *  1. Attach CDP debugger to the tab.
+ *  2. Enable Fetch domain with a pattern matching all Script resources.
+ *  3. On Fetch.requestPaused (response stage):
+ *     a. If the response already has a SourceMap/X-SourceMap header -> pass through.
+ *     b. Otherwise probe <script-url>.map with a HEAD request.
+ *     c. If the map exists, append a SourceMap header and continue the response.
+ *     d. Either way, call Fetch.continueResponse so the request is never stalled.
+ *  4. Also listen to Debugger.scriptParsed to catch scripts already in the page
+ *     before we attached (cached / inline).
  */
 
 const BUNDLE_PATTERN = /\.(bundle|chunk|min)\.js(\?[^.]*)?$|\/[0-9a-f]{8,}\.js(\?.*)?$/i;
 
-/** tabId → { attached: bool, scripts: Map<scriptId, scriptInfo> } */
+/** tabId -> { attached: bool, scripts: Map<url, scriptInfo> } */
 const tabState = new Map();
 
-// ─── Debugger event dispatch ──────────────────────────────────────────────────
+// --- CDP event dispatch ------------------------------------------------------
 
 chrome.debugger.onEvent.addListener(async (source, method, params) => {
   const state = tabState.get(source.tabId);
   if (!state) return;
 
-  if (method === "Debugger.scriptParsed") {
-    await handleScriptParsed(source.tabId, params, state);
+  if (method === "Fetch.requestPaused") {
+    await handleFetchRequestPaused(source.tabId, params, state);
   }
 
-  if (method === "Network.responseReceived") {
-    await handleNetworkResponse(source.tabId, params, state);
+  if (method === "Debugger.scriptParsed") {
+    handleScriptParsed(source.tabId, params, state);
   }
 });
 
@@ -49,7 +43,7 @@ chrome.debugger.onDetach.addListener((source) => {
   broadcastToPanel({ type: "DETACHED", tabId: source.tabId });
 });
 
-// ─── Attach / Detach ──────────────────────────────────────────────────────────
+// --- Attach / Detach ---------------------------------------------------------
 
 async function attachToTab(tabId) {
   if (tabState.get(tabId)?.attached) return { ok: true, alreadyAttached: true };
@@ -59,7 +53,11 @@ async function attachToTab(tabId) {
     tabState.set(tabId, { attached: true, scripts: new Map() });
 
     await sendCommand(tabId, "Debugger.enable", {});
-    await sendCommand(tabId, "Network.enable", {});
+
+    // Intercept all Script responses — filter to bundles inside the handler
+    await sendCommand(tabId, "Fetch.enable", {
+      patterns: [{ requestStage: "Response", resourceType: "Script" }],
+    });
 
     broadcastToPanel({ type: "ATTACHED", tabId });
     return { ok: true };
@@ -77,107 +75,118 @@ async function detachFromTab(tabId) {
   broadcastToPanel({ type: "DETACHED", tabId });
 }
 
-// ─── Script handling ──────────────────────────────────────────────────────────
-
-async function handleScriptParsed(tabId, params, state) {
-  const { scriptId, url, sourceMapURL } = params;
-  if (!url || !BUNDLE_PATTERN.test(url)) return;
-
-  const mapUrl = resolveMapUrl(url, sourceMapURL);
-  const entry = { scriptId, url, sourceMapURL: mapUrl, status: "detected", injected: false };
-  state.scripts.set(scriptId, entry);
-
-  broadcastToPanel({ type: "SCRIPT_DETECTED", tabId, script: entry });
-
-  if (!mapUrl) {
-    // No map advertised — probe for <url>.map
-    const probeUrl = url.split("?")[0] + ".map";
-    const exists = await probeMapUrl(probeUrl);
-    if (exists) {
-      entry.sourceMapURL = probeUrl;
-      entry.status = "map_found";
-      await injectSourceMapURL(tabId, scriptId, url, probeUrl);
-      entry.injected = true;
-      broadcastToPanel({ type: "SCRIPT_UPDATED", tabId, script: entry });
-    } else {
-      entry.status = "no_map";
-      broadcastToPanel({ type: "SCRIPT_UPDATED", tabId, script: entry });
-    }
-  } else {
-    entry.status = "has_map";
-    broadcastToPanel({ type: "SCRIPT_UPDATED", tabId, script: entry });
-  }
-}
-
-async function handleNetworkResponse(tabId, params, state) {
-  // Additional check: look for SourceMap / X-SourceMap response headers
-  const { requestId, response, type } = params;
-  if (type !== "Script") return;
-
-  const headers = response?.headers || {};
-  const headerMap = Object.fromEntries(
-    Object.entries(headers).map(([k, v]) => [k.toLowerCase(), v])
-  );
-
-  const headerSourceMap = headerMap["sourcemap"] || headerMap["x-sourcemap"];
-  if (headerSourceMap) {
-    // Resolve relative URLs
-    const resolved = new URL(headerSourceMap, response.url).href;
-    broadcastToPanel({
-      type: "HEADER_MAP_FOUND",
-      tabId,
-      scriptUrl: response.url,
-      mapUrl: resolved,
-    });
-  }
-}
-
-// ─── Source map injection ─────────────────────────────────────────────────────
+// --- Fetch interception ------------------------------------------------------
 
 /**
- * Injects a //# sourceMappingURL comment into the live script via CDP.
- * We use Debugger.setScriptSource to append the pragma — however this API
- * requires us to pass the full new source, which we don't have cheaply.
- *
- * Better: use Runtime.evaluate to dynamically add a <script> with the
- * sourceMappingURL pragma, which DevTools will pick up for that URL.
- *
- * The most reliable MV3-compatible method: call Runtime.evaluate with
- * a script that creates a blob URL pointing to a minimal JS file with
- * the sourceMappingURL appended, and registers it via a <script> tag trick.
- *
- * NOTE: This works best when DevTools is already open and the Sources panel
- * has loaded the original script. The inject causes DevTools to re-associate.
+ * Called for every Script response while paused.
+ * We MUST always call Fetch.continueResponse before returning — otherwise
+ * the request hangs indefinitely and the page stalls.
  */
-async function injectSourceMapURL(tabId, scriptId, scriptUrl, mapUrl) {
+async function handleFetchRequestPaused(tabId, params, state) {
+  const { requestId, request, responseHeaders } = params;
+  const url = request.url;
+
+  // Pass non-bundle scripts straight through
+  if (!BUNDLE_PATTERN.test(url)) {
+    await continueResponse(tabId, requestId);
+    return;
+  }
+
+  // Normalise headers for case-insensitive lookup
+  const headersArray = responseHeaders || [];
+  const headerMap = Object.fromEntries(
+    headersArray.map(h => [h.name.toLowerCase(), h.value])
+  );
+
+  // Already has a SourceMap header — record and pass through
+  const existingMapHeader = headerMap["sourcemap"] || headerMap["x-sourcemap"];
+  if (existingMapHeader) {
+    const resolvedMap = resolveMapUrl(url, existingMapHeader);
+    recordScript(tabId, state, { url, sourceMapURL: resolvedMap, status: "has_map", intercepted: false });
+    await continueResponse(tabId, requestId);
+    return;
+  }
+
+  // No header — probe for <url>.map
+  const probeUrl = url.split("?")[0] + ".map";
+  const mapExists = await probeMapUrl(probeUrl);
+
+  if (!mapExists) {
+    recordScript(tabId, state, { url, sourceMapURL: null, status: "no_map", intercepted: false });
+    await continueResponse(tabId, requestId);
+    return;
+  }
+
+  // Map found — inject the SourceMap header before Chrome parses the script
+  const patchedHeaders = [...headersArray, { name: "SourceMap", value: probeUrl }];
+
   try {
-    // Use CDP Debugger.setBlackboxPatterns is not what we need.
-    // The correct CDP method is actually just ensuring the script has
-    // sourceMapURL set. We do this by injecting a tiny script that
-    // registers the source map pragma via a comment in an inline script.
-    const js = `
-      (() => {
-        const s = document.createElement('script');
-        s.textContent = ${JSON.stringify(`//# sourceURL=${scriptUrl}\n//# sourceMappingURL=${mapUrl}`)};
-        document.head.appendChild(s);
-        s.remove();
-      })();
-    `;
-    await sendCommand(tabId, "Runtime.evaluate", {
-      expression: js,
-      silent: true,
+    await sendCommand(tabId, "Fetch.continueResponse", {
+      requestId,
+      responseHeaders: patchedHeaders,
     });
-    console.log(`[SourceMap Loader] Injected sourceMappingURL for ${scriptUrl} → ${mapUrl}`);
+    recordScript(tabId, state, { url, sourceMapURL: probeUrl, status: "map_found", intercepted: true });
   } catch (err) {
-    console.warn("[SourceMap Loader] inject failed:", err.message);
+    // continueResponse failed (request cancelled etc.) — don't stall the page
+    console.warn("[SourceMap Loader] continueResponse failed:", err.message);
+    await continueResponse(tabId, requestId).catch(() => {});
+    recordScript(tabId, state, { url, sourceMapURL: probeUrl, status: "map_found", intercepted: false });
   }
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// --- Debugger.scriptParsed ---------------------------------------------------
+
+/**
+ * Fires after the script is parsed. The Fetch interceptor already ran by this
+ * point, so sourceMapURL will be populated if we injected the header. We use
+ * this mainly to catch scripts already present before we attached (cached /
+ * inline scripts that bypass the Fetch domain).
+ */
+function handleScriptParsed(tabId, params, state) {
+  const { url, sourceMapURL } = params;
+  if (!url || !BUNDLE_PATTERN.test(url)) return;
+
+  // Don't overwrite a richer entry already set by the Fetch interceptor
+  if (state.scripts.has(url)) return;
+
+  const resolvedMap = resolveMapUrl(url, sourceMapURL);
+  recordScript(tabId, state, {
+    url,
+    sourceMapURL: resolvedMap,
+    status: resolvedMap ? "has_map" : "no_map",
+    intercepted: false,
+  });
+}
+
+// --- Helpers -----------------------------------------------------------------
+
+function recordScript(tabId, state, entry) {
+  const existing = state.scripts.get(entry.url);
+  // Don't downgrade a successfully intercepted entry with a later scriptParsed
+  if (existing?.intercepted && !entry.intercepted) return;
+
+  state.scripts.set(entry.url, entry);
+  broadcastToPanel({ type: existing ? "SCRIPT_UPDATED" : "SCRIPT_DETECTED", tabId, script: entry });
+
+  if (entry.status === "map_found" && entry.intercepted) {
+    broadcastToPanel({ type: "LOG", tabId, level: "ok", msg: `SourceMap header injected: ${shortUrl(entry.url)} -> ${shortUrl(entry.sourceMapURL)}` });
+  } else if (entry.status === "no_map") {
+    broadcastToPanel({ type: "LOG", tabId, level: "warn", msg: `No map found for: ${shortUrl(entry.url)}` });
+  } else if (entry.status === "has_map") {
+    broadcastToPanel({ type: "LOG", tabId, level: "ok", msg: `Map already present: ${shortUrl(entry.url)}` });
+  }
+}
+
+async function continueResponse(tabId, requestId) {
+  try {
+    await sendCommand(tabId, "Fetch.continueResponse", { requestId });
+  } catch (err) {
+    console.warn("[SourceMap Loader] continueResponse fallback failed:", err.message);
+  }
+}
 
 function resolveMapUrl(scriptUrl, sourceMapURL) {
   if (!sourceMapURL) return null;
-  // Inline data URLs — already embedded, no need to fetch
   if (sourceMapURL.startsWith("data:")) return sourceMapURL;
   try {
     return new URL(sourceMapURL, scriptUrl).href;
@@ -195,6 +204,15 @@ async function probeMapUrl(url) {
   }
 }
 
+function shortUrl(url) {
+  if (!url) return "";
+  try {
+    return new URL(url).pathname.split("/").pop() || url;
+  } catch {
+    return url.split("/").pop() || url;
+  }
+}
+
 function sendCommand(tabId, method, params) {
   return new Promise((resolve, reject) => {
     chrome.debugger.sendCommand({ tabId }, method, params, (result) => {
@@ -209,11 +227,11 @@ function sendCommand(tabId, method, params) {
 
 function broadcastToPanel(message) {
   chrome.runtime.sendMessage(message).catch(() => {
-    // Panel may not be open yet — that's fine
+    // Panel may not be open — that's fine
   });
 }
 
-// ─── Message handler (from panel) ────────────────────────────────────────────
+// --- Message handler (from panel) --------------------------------------------
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "ATTACH") {
@@ -230,17 +248,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       attached: state?.attached ?? false,
       scripts: state ? Array.from(state.scripts.values()) : [],
     });
-    return true;
-  }
-  if (message.type === "RETRY_INJECT") {
-    const state = tabState.get(message.tabId);
-    const entry = state?.scripts.get(message.scriptId);
-    if (entry?.sourceMapURL) {
-      injectSourceMapURL(message.tabId, message.scriptId, entry.url, entry.sourceMapURL)
-        .then(() => sendResponse({ ok: true }));
-    } else {
-      sendResponse({ ok: false, error: "No map URL known for this script" });
-    }
     return true;
   }
 });
